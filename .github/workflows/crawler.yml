@@ -1,0 +1,47 @@
+# Krao.gg leaderboard crawler. This file and crawl.mjs + package.json live in the
+# PUBLIC repo lucascarneiro26/krao-releases (public repos get free, unlimited
+# Actions minutes); the source of truth is tools/crawler in the private monorepo.
+#
+# Secret (krao-releases → Settings → Secrets and variables → Actions):
+#   DATABASE_URL   the Neon connection string (the same one Vercel uses)
+
+name: Leaderboard crawler
+
+on:
+  schedule:
+    # Every 6 hours; each run works for up to ~5h20 and then stops by itself.
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Minutes to work"
+        default: "320"
+      server:
+        description: "Only this server id (optional, for tests)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crawler
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    defaults:
+      run:
+        working-directory: crawler
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node crawl.mjs
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BUDGET_MIN: ${{ inputs.budget || '320' }}
+          SERVER: ${{ inputs.server }}

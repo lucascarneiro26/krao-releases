@@ -1,0 +1,12 @@
+{
+  "name": "krao-crawler",
+  "private": true,
+  "type": "module",
+  "description": "Krao.gg leaderboard crawler (runs on GitHub Actions; see crawl.mjs)",
+  "scripts": {
+    "crawl": "node crawl.mjs"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  }
+}
