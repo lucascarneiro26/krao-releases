@@ -2,10 +2,12 @@
 //
 // NCSOFT has no Combat Power ranking for AION 2 Global, so this walks every
 // server itself, gently:
-//   1. refresh: re-reads the top 100 of each class on each server once a day;
-//   2. scan: once a week per server, finds every level-45 character through the
-//      public search, reads their Combat Power and keeps the strongest KEEP of
-//      each class in the site's database;
+//   1. refresh: re-reads the top of each class on each server once a day;
+//   2. scan: finds every level-45 character of a server through the public
+//      search and reads their Combat Power. Priority regions (South America,
+//      "la", by default) come first, are rescanned every 2 days and keep
+//      everyone; other regions are rescanned weekly and keep the strongest KEEP
+//      of each class;
 //   3. items: records what the top players of each class wear, with the
 //      official tooltip, which is the site's item database.
 //
@@ -14,7 +16,9 @@
 // reads; the site's migrations create them.
 //
 // Env: DATABASE_URL (required), BUDGET_MIN (default 320), RATE_MS (min gap
-// between requests, default 150), CONCURRENCY (default 6), KEEP (default 150),
+// between requests, default 350; it grows by itself when NCSOFT says 429),
+// CONCURRENCY (default 4), KEEP (per class
+// outside priority regions, default 50), PRIORITY (regions, default "la"),
 // REGIONS (comma list, default all), SERVER (one server id, for tests), LIMIT
 // (characters per server, for tests),
 // DRY_RUN=1 (read NCSOFT, write nothing).
@@ -22,10 +26,13 @@
 
 const env = process.env;
 const BUDGET_MS = Number(env.BUDGET_MIN ?? 320) * 60_000;
-const RATE_MS = Number(env.RATE_MS ?? 150);
-const CONCURRENCY = Number(env.CONCURRENCY ?? 6);
-const KEEP = Number(env.KEEP ?? 150);
-const TOP_REFRESH = 100;
+const RATE_MS = Number(env.RATE_MS ?? 350);
+const CONCURRENCY = Number(env.CONCURRENCY ?? 4);
+const KEEP = Number(env.KEEP ?? 50);
+const PRIORITY = new Set((env.PRIORITY ?? "la").split(",").map((r) => r.trim()).filter(Boolean));
+/** Daily refresh depth per class: deeper where players are ours. */
+const TOP_REFRESH = { priority: 300, other: KEEP };
+const RESCAN_DAYS = { priority: 2, other: 14 };
 const TOP_ITEMS = 20;
 const MAX_LEVEL = 45;
 const KEYWORDS = ["a", "e", "i", "o", "u", "y"];
@@ -42,15 +49,33 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // HTTP, with one shared pace for every request and retries on hiccups.
 
+// The gap between requests adapts: NCSOFT answers 429 when we go too fast, so
+// each 429 doubles the gap and every 100 good answers shave 5% off it again.
+let gap = RATE_MS;
+let goodStreak = 0;
 let nextSlot = 0;
 async function pace() {
   const now = Date.now();
   const wait = Math.max(0, nextSlot - now);
-  nextSlot = Math.max(now, nextSlot) + RATE_MS;
+  nextSlot = Math.max(now, nextSlot) + gap;
   if (wait) await sleep(wait);
 }
+function slowDown(retryAfterS) {
+  gap = Math.min(10_000, Math.max(gap * 2, RATE_MS));
+  goodStreak = 0;
+  // Everyone waits, not just the request that was refused.
+  nextSlot = Math.max(nextSlot, Date.now() + Math.max(retryAfterS * 1000 || 0, 5_000));
+  stats.throttled++;
+  if (stats.throttled % 10 === 1) log(`  NCSOFT asked us to slow down: ${gap} ms between requests now`);
+}
+function wentWell() {
+  if (++goodStreak >= 100 && gap > RATE_MS) {
+    gap = Math.max(RATE_MS, Math.round(gap * 0.95));
+    goodStreak = 0;
+  }
+}
 
-const stats = { requests: 0, errors: 0, notFound: 0 };
+const stats = { requests: 0, errors: 0, notFound: 0, throttled: 0 };
 
 class NotFound extends Error {}
 
@@ -67,16 +92,22 @@ async function getJson(url, params) {
         signal: AbortSignal.timeout(20_000),
       });
       if (res.status === 404 || (res.status >= 300 && res.status < 400)) throw new NotFound(u.pathname);
-      if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`);
+      if (res.status === 429) {
+        slowDown(Number(res.headers.get("retry-after")));
+        throw new Error("HTTP 429");
+      }
+      if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
       if (!res.ok) throw new NotFound(`HTTP ${res.status}`);
-      return await res.json();
+      const body = await res.json();
+      wentWell();
+      return body;
     } catch (e) {
       if (e instanceof NotFound) {
         stats.notFound++;
         throw e;
       }
       stats.errors++;
-      if (attempt >= 4) throw e;
+      if (attempt >= 6) throw e;
       // Back off harder each time; a 429 means we are too fast for them.
       await sleep(2000 * 2 ** attempt);
     }
@@ -231,7 +262,7 @@ async function pool(list, fn, until = Infinity) {
       try {
         await fn(item);
       } catch (e) {
-        if (!(e instanceof NotFound)) log("  !", e.message);
+        if (!(e instanceof NotFound) && e.message !== "HTTP 429") log("  !", e.message);
       }
     }
   });
@@ -245,9 +276,10 @@ async function refreshTop(classes, until) {
   const r = await q(
     `SELECT server_id, character_id, region, server_name FROM (
        SELECT *, row_number() OVER (PARTITION BY server_id, class_key ORDER BY combat_power DESC) AS rank FROM characters
-     ) t WHERE rank <= $1 AND updated_at < now() - interval '20 hours' ${ONLY_SERVER ? "AND server_id = $2" : ""}
-     ORDER BY updated_at LIMIT 100000`,
-    ONLY_SERVER ? [TOP_REFRESH, ONLY_SERVER] : [TOP_REFRESH],
+     ) t WHERE rank <= CASE WHEN region = ANY($3::text[]) THEN $1::int ELSE $2::int END
+       AND updated_at < now() - interval '20 hours' ${ONLY_SERVER ? "AND server_id = $4::int" : ""}
+     ORDER BY (region = ANY($3::text[])) DESC, updated_at LIMIT 100000`,
+    [TOP_REFRESH.priority, TOP_REFRESH.other, [...PRIORITY], ...(ONLY_SERVER ? [ONLY_SERVER] : [])],
   );
   if (r.rows.length === 0) return;
   log(`refresh: ${r.rows.length} characters due`);
@@ -275,12 +307,17 @@ async function scanServer(server, classes) {
   const candidates = await discover(server, classes.byRace[server.raceId] ?? []);
   log(`scan ${server.region}/${server.name}: ${candidates.size} level-${MAX_LEVEL} characters`);
   const ids = [...candidates.keys()].filter((id) => !removed.has(`${server.id}:${id}`)).slice(0, LIMIT);
+  const known = new Set(
+    (await q("SELECT character_id FROM characters WHERE server_id = $1", [server.id])).rows.map((r) => r.character_id),
+  );
   const read = [];
   await pool(ids, async (id) => {
     read.push(await characterInfo(id, server));
   });
-  if (timeLeft() < 30_000 && read.length < ids.length * 0.9) {
-    log(`scan ${server.name}: out of time after ${read.length}/${ids.length}, will redo next run`);
+  if (read.length < ids.length * 0.9) {
+    // Out of time or too many refusals: save what we read, but scan this server again next run.
+    log(`scan ${server.name}: only ${read.length}/${ids.length} read, will redo next run`);
+    for (const c of read) if (known.has(c.id) || PRIORITY.has(server.region)) await save(c, server.region, classes);
     return false;
   }
 
@@ -290,15 +327,13 @@ async function scanServer(server, classes) {
     const k = classes.get(c.pcId) ?? "?";
     byClass.set(k, [...(byClass.get(k) ?? []), c]);
   }
-  const known = new Set(
-    (await q("SELECT character_id FROM characters WHERE server_id = $1", [server.id])).rows.map((r) => r.character_id),
-  );
   let kept = 0;
   const topForItems = [];
+  const keep = PRIORITY.has(server.region) ? Infinity : KEEP;
   for (const list of byClass.values()) {
     list.sort((a, b) => b.combatPower - a.combatPower);
     for (const [i, c] of list.entries()) {
-      if (i < KEEP || known.has(c.id)) {
+      if (i < keep || known.has(c.id)) {
         await save(c, server.region, classes);
         kept++;
       }
@@ -384,18 +419,19 @@ async function main() {
 
   const all = (await Promise.all(REGIONS.map((r) => servers(r)))).flat().filter((s) => !ONLY_SERVER || s.id === ONLY_SERVER);
   const last = new Map((await q("SELECT server_id, last_scan_at FROM crawl_servers")).rows.map((r) => [r.server_id, r.last_scan_at]));
+  const lastAt = (s) => new Date(last.get(s.id) ?? 0).getTime() || 0;
   const due = all
     .filter((s) => {
-      const at = last.get(s.id);
-      return ONLY_SERVER || !at || new Date(at).getTime() < Date.now() - 6 * 86_400_000;
+      const days = PRIORITY.has(s.region) ? RESCAN_DAYS.priority : RESCAN_DAYS.other;
+      return ONLY_SERVER || lastAt(s) < Date.now() - (days - 0.25) * 86_400_000;
     })
-    .sort((a, b) => (new Date(last.get(a.id) ?? 0).getTime() || 0) - (new Date(last.get(b.id) ?? 0).getTime() || 0));
-  log(`scan: ${due.length} of ${all.length} servers due`);
+    .sort((a, b) => Number(PRIORITY.has(b.region)) - Number(PRIORITY.has(a.region)) || lastAt(a) - lastAt(b));
+  log(`scan: ${due.length} of ${all.length} servers due (priority: ${[...PRIORITY].join(", ")})`);
   for (const s of due) {
     if (timeLeft() < Math.min(15 * 60_000, BUDGET_MS / 4)) break;
     await scanServer(s, classes);
   }
-  log(`done: ${stats.requests} requests, ${stats.errors} retried errors, ${stats.notFound} not found`);
+  log(`done: ${stats.requests} requests, ${stats.errors} retried errors, ${stats.throttled} slow-downs, ${stats.notFound} not found, final gap ${gap} ms`);
 }
 
 main()
