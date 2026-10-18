@@ -9,7 +9,9 @@
 //      everyone; other regions are rescanned weekly and keep the strongest KEEP
 //      of each class;
 //   3. items: records what the top players of each class wear, with the
-//      official tooltip, which is the site's item database.
+//      official tooltip, which is the site's item database;
+//   0. seen: before all that, looks up the players the Krao.gg app saw in the
+//      game (seen_players), so active players join or refresh the ranking first.
 //
 // Runs on GitHub Actions (see workflow.yml) with DATABASE_URL as a secret. It
 // only reads public endpoints and only writes the tables the site already
@@ -20,7 +22,7 @@
 // CONCURRENCY (default 4), KEEP (per class
 // outside priority regions, default 50), PRIORITY (regions, default "la"),
 // REGIONS (comma list, default all), SERVER (one server id, for tests), LIMIT
-// (characters per server, for tests),
+// (characters per server, for tests), SEEN_BATCH (names seen in game per run, default 2000),
 // DRY_RUN=1 (read NCSOFT, write nothing).
 
 
@@ -270,6 +272,45 @@ async function pool(list, fn, until = Infinity) {
   return i;
 }
 
+// 0. Players the app saw in the game: searched by name, saved like the rest.
+
+const SEEN_BATCH = Number(env.SEEN_BATCH ?? 2000);
+const SEEN_AGAIN_HOURS = 20;
+
+async function lookUpSeen(classes, until) {
+  const r = await q(
+    `SELECT region, name, name_lower FROM seen_players
+     WHERE (looked_at IS NULL OR (looked_at < last_seen_at AND looked_at < now() - make_interval(hours => $2::int)))
+       AND region = ANY($3::text[])
+     ORDER BY looked_at NULLS FIRST, seen_count DESC, last_seen_at DESC LIMIT $1::int`,
+    [SEEN_BATCH, SEEN_AGAIN_HOURS, REGIONS],
+  );
+  if (r.rows.length === 0) return;
+  log(`seen: ${r.rows.length} names from the app`);
+  let found = 0;
+  const done = await pool(
+    r.rows,
+    async (row) => {
+      const d = await getJson(SEARCH, { keyword: row.name, region: row.region, localeInfo: LANG, size: 50, page: 1 });
+      // The same name can exist on several servers: every exact match is read.
+      // The search marks the match with <strong>…</strong>.
+      const hits = arr(d.list).filter((c) => str(c.name).replace(/<[^>]*>/g, "").toLowerCase() === row.name_lower);
+      for (const c of hits) {
+        const server = { id: num(c.serverId), region: row.region, name: str(c.serverName) };
+        try {
+          await save(await characterInfo(decodeId(str(c.characterId)), server), row.region, classes);
+          found++;
+        } catch (e) {
+          if (!(e instanceof NotFound)) throw e;
+        }
+      }
+      await q("UPDATE seen_players SET looked_at = now() WHERE region = $1 AND name_lower = $2", [row.region, row.name_lower]);
+    },
+    until,
+  );
+  log(`seen: ${done} names searched, ${found} characters saved`);
+}
+
 // 1. Daily refresh of the top of each class on each server.
 
 async function refreshTop(classes, until) {
@@ -414,7 +455,9 @@ async function main() {
   const classes = await classMap();
   await loadRemoved();
 
-  // A third of the time at most goes to the daily refresh; the rest to weekly scans.
+  // Names seen in game first (a tenth of the time at most), then a third at most
+  // to the daily refresh; the rest to weekly scans.
+  await lookUpSeen(classes, Date.now() + BUDGET_MS / 10);
   await refreshTop(classes, Date.now() + BUDGET_MS / 3);
 
   const all = (await Promise.all(REGIONS.map((r) => servers(r)))).flat().filter((s) => !ONLY_SERVER || s.id === ONLY_SERVER);
